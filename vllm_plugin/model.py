@@ -556,6 +556,10 @@ class VibeVoiceProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}
 
+    # vLLM >= 0.21.0: get_data_parser moved from processor to info class
+    def get_data_parser(self) -> MultiModalDataParser:
+        return MultiModalDataParser(target_sr=24000)
+
     def get_mm_max_tokens_per_item(
         self,
         seq_len: int,
@@ -621,8 +625,10 @@ class VibeVoiceDummyInputsBuilder(BaseDummyInputsBuilder[VibeVoiceProcessingInfo
         compress_ratio = int(_cfg("speech_tok_compress_ratio", 3200))
         sample_rate = int(_cfg("target_sample_rate", 24000))
 
-        # Upper bound: 61-minute audio at 24 kHz
-        max_hour_samples = 61 * 60 * sample_rate  # 88,464,000
+        # Must match get_mm_max_tokens_per_item so profiling sizes the
+        # encoder cache for the same worst-case audio length.
+        max_minutes = int(os.getenv("VIBEVOICE_MAX_AUDIO_MINUTES", "120"))
+        max_hour_samples = max_minutes * 60 * sample_rate
         max_tokens_from_audio = int(np.ceil(max_hour_samples / compress_ratio)) + 3
         # Cannot exceed model context window
         max_tokens = min(max_tokens_from_audio, seq_len)
@@ -670,10 +676,18 @@ class VibeVoiceDummyInputsBuilder(BaseDummyInputsBuilder[VibeVoiceProcessingInfo
         mm_options: Mapping[str, Any] | None = None,
     ) -> ProcessorInputs:
         """Build ProcessorInputs for dummy profiling."""
-        return ProcessorInputs(
-            prompt=self.get_dummy_text(mm_counts),
-            mm_data=self.get_dummy_mm_data(seq_len, mm_counts, mm_options),
-        )
+        prompt = self.get_dummy_text(mm_counts)
+        mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
+
+        # vLLM >= 0.21.0 renamed mm_data -> mm_data_items with a different type
+        try:
+            from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+            mm_data_items = MultiModalDataItems({
+                "audio": AudioProcessorItems(mm_data.get("audio", []))
+            })
+            return ProcessorInputs(prompt=prompt, mm_data_items=mm_data_items)
+        except (ImportError, TypeError):
+            return ProcessorInputs(prompt=prompt, mm_data=mm_data)
 
 
 def _vibevoice_field_config(hf_inputs: Mapping[str, torch.Tensor]):
@@ -710,8 +724,7 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
     def _get_data_parser(self) -> MultiModalDataParser:
         """Create a data parser with the correct target sample rate (24kHz)."""
         # VibeVoice requires 24kHz, not 16kHz (Whisper default)
-        target_sr = 24000
-        return MultiModalDataParser(target_sr=target_sr)
+        return MultiModalDataParser(target_sr=24000)
     
     def _call_hf_processor(
         self,
